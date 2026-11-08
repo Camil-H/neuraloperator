@@ -1,4 +1,5 @@
 from ..resample import resample
+import math
 import torch
 import numpy as np
 
@@ -173,3 +174,22 @@ def test_resampling_complex_even_resolution():
         # Check that the error is close to zero.
         relative_error = (torch.linalg.norm(f_eval_increased - f_eval_resampled) / torch.linalg.norm(f_eval_increased))
         assert(relative_error < 1e-5)
+
+
+def test_resample_nyquist_mode():
+    # Nyquist modes of an even grid must keep their amplitude when resampled,
+    # including along the rfft axis and when several axes are at Nyquist at once.
+    def harmonic(shape, frequencies):
+        grids = torch.meshgrid(*[torch.arange(n) for n in shape], indexing="ij")
+        return math.prod(torch.cos(2 * torch.pi * f * g / n) for f, g, n in zip(frequencies, grids, shape)).reshape(1, 1, *shape)
+
+    for frequencies in [(4, 0, 0), (0, 0, 4), (4, 4, 0)]:
+        for spatial_shape, output_shape in [((8, 8, 8), (16, 16, 16)), ((16, 16, 16), (8, 8, 8))]:
+            x = harmonic(spatial_shape, frequencies)
+            expected = harmonic(output_shape, frequencies)
+
+            y = resample(x, 1.0, [2, 3, 4], output_shape=output_shape)
+            torch.testing.assert_close(y, expected, atol=1e-5, rtol=1e-5)
+
+            y = resample(x.to(torch.cfloat), 1.0, [2, 3, 4], output_shape=output_shape)
+            torch.testing.assert_close(y, expected.to(torch.cfloat), atol=1e-5, rtol=1e-5)

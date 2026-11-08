@@ -4,6 +4,26 @@ import torch
 import torch.nn.functional as F
 
 
+def _fold_nyquist(X, axis, new_size):
+    """Downsampling to an even size p: modes +p/2 and -p/2 alias onto the same bin."""
+    X = X.clone()
+    for dim, p in zip(axis, new_size):
+        n = X.shape[dim]
+        if p < n and p % 2 == 0:
+            X.select(dim, n - p // 2).add_(X.select(dim, p // 2))
+    return X
+
+
+def _split_nyquist(out_fft, axis, old_size):
+    """Upsampling from an even size n: share the Nyquist mode between +n/2 and -n/2."""
+    for dim, n in zip(axis, old_size):
+        p = out_fft.shape[dim]
+        if p > n and n % 2 == 0:
+            neg = out_fft.select(dim, p - n // 2)
+            neg.div_(2)
+            out_fft.select(dim, n // 2).copy_(neg)
+
+
 def resample(x, res_scale, axis, output_shape=None):
     """A module for generic n-dimentional interpolation.
 
@@ -51,7 +71,7 @@ def resample(x, res_scale, axis, output_shape=None):
         new_size = output_shape
 
     if x.is_complex():
-        X = torch.fft.fftn(x, norm="forward", dim=axis)
+        X = _fold_nyquist(torch.fft.fftn(x, norm="forward", dim=axis), axis, new_size)
 
         new_fft_size = list(new_size)
         new_fft_size_c = [min(i, j) for (i, j) in zip(new_fft_size, X.shape[-len(axis) :])]
@@ -65,6 +85,7 @@ def resample(x, res_scale, axis, output_shape=None):
 
             idx_tuple = tuple(idx_tuple)
             out_fft[idx_tuple] = X[idx_tuple]
+        _split_nyquist(out_fft, axis, old_size)
         return torch.fft.ifftn(out_fft, s=new_size, norm="forward", dim=axis)
 
     if len(axis) == 1:
@@ -72,7 +93,7 @@ def resample(x, res_scale, axis, output_shape=None):
     if len(axis) == 2:
         return F.interpolate(x, size=new_size, mode="bicubic", align_corners=True)
 
-    X = torch.fft.rfftn(x.float(), norm="forward", dim=axis)
+    X = _fold_nyquist(torch.fft.rfftn(x.float(), norm="forward", dim=axis), axis[:-1], new_size[:-1])
 
     new_fft_size = list(new_size)
     new_fft_size[-1] = new_fft_size[-1] // 2 + 1  # Redundant last coefficient
@@ -87,6 +108,11 @@ def resample(x, res_scale, axis, output_shape=None):
 
         idx_tuple = tuple(idx_tuple)
         out_fft[idx_tuple] = X[idx_tuple]
+    _split_nyquist(out_fft, axis[:-1], old_size[:-1])
+    # irfft counts the Nyquist mode once only when it is the last coefficient
+    n, p = old_size[-1], new_size[-1]
+    if n != p and min(n, p) % 2 == 0:
+        out_fft.select(-1, min(n, p) // 2).mul_(0.5 if p > n else 2)
     y = torch.fft.irfftn(out_fft, s=new_size, norm="forward", dim=axis)
 
     return y
