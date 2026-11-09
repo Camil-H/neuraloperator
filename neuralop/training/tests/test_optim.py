@@ -4,6 +4,7 @@ from torch.testing import assert_close
 import pytest
 import math
 import neuralop.training.tensorgrad as tensorgrad_module
+from tensorly.base import unfold
 
 from ..adamw import AdamW
 from ..tensorgrad import (
@@ -269,3 +270,16 @@ def test_fno_tensorgrad_param_groups_select_spectral_params():
     assert groups[1]["sparse_ratio"] == 0.05
     assert tensorgrad_params
     assert regular_ids.isdisjoint(tensorgrad_ids)
+
+
+@pytest.mark.parametrize("mode", range(4))
+def test_tensorgrad_projector_is_mode_unfolding_projection(mode):
+    torch.manual_seed(0)
+    grad = torch.randn(8, 6, 5, 3, dtype=torch.cfloat)
+    u = torch.linalg.svd(unfold(grad, mode), full_matrices=False)[0][:, :2]
+    factors = [u if k == mode else torch.eye(n, dtype=grad.dtype) for k, n in enumerate(grad.shape)]
+    projector = TensorGRaDProjector(rank=None)
+
+    restored = projector.inverse_transform(factors, projector.transform(factors, grad))
+
+    assert_close(unfold(restored, mode), u @ (u.mH @ unfold(grad, mode)))
