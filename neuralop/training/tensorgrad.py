@@ -111,6 +111,11 @@ class EighProjector(TensorGRaDProjector):
     plus a small eigendecomposition. Both run in double precision, because
     squaring the singular values squares the condition number.
 
+    Factors are only defined up to a unitary rotation within their subspace,
+    while Adam's moments live in the coordinates of the previous factors. With
+    ``align=True`` each new factor is rotated onto the previous one by an
+    orthogonal Procrustes step, which leaves the subspace unchanged.
+
     Parameters
     ----------
     rank : tuple[int, ...]
@@ -119,10 +124,19 @@ class EighProjector(TensorGRaDProjector):
         Number of optimizer steps between projection-tensor updates.
     scale : float, optional
         Scalar applied after projecting low-rank updates back to full size.
+    align : bool, optional
+        Whether to Procrustes-align each new factor to the previous one.
     """
 
+    def __init__(self, rank, update_proj_gap: int = 200, scale: float = 1.0, align: bool = False):
+        super().__init__(rank, update_proj_gap=update_proj_gap, scale=scale)
+        self.align = align
+
     def get_projection_tensor(self, weights, rank):
-        return [self.basis(unfold(weights.data, mode), r) for mode, r in enumerate(rank)]
+        factors = [self.basis(unfold(weights.data, mode), r) for mode, r in enumerate(rank)]
+        if self.align and self.proj_tensor is not None:
+            factors = [procrustes_align(u, previous) for u, previous in zip(factors, self.proj_tensor)]
+        return factors
 
     def basis(self, a, rank):
         a_double = a.to(torch.complex128 if a.is_complex() else torch.float64)
@@ -130,15 +144,26 @@ class EighProjector(TensorGRaDProjector):
         return eigenvectors[:, -rank:].flip(-1).to(a.dtype)
 
 
-class GaussianSketchProjector(TensorGRaDProjector):
+def procrustes_align(u, reference):
+    """Rotate the orthonormal columns of ``u`` to best match ``reference``.
+
+    Returns ``u R`` with ``R`` the unitary minimizing ``||u R - reference||_F``,
+    i.e. the polar factor of ``u^H reference``. The column span is unchanged.
+    """
+    left, _, right_h = torch.linalg.svd(u.mH @ reference)
+    return u @ (left @ right_h)
+
+
+class GaussianSketchProjector(EighProjector):
     """Low-rank gradient projector whose factors come from a randomized range finder.
 
     Drop-in replacement for :class:`TensorGRaDProjector`: the projection is the
     same mode-wise product, but each factor ``U_k`` is the top-``r_k`` left
     singular subspace of the mode-``k`` unfolding estimated from a random
     sketch ``Y = (A A^H)^q A Omega`` instead of a Tucker decomposition. Modes
-    where the sketch would be at least as wide as the unfolding use an exact
-    SVD. Subclasses change the random map by overriding :meth:`sketch`.
+    where the sketch would be at least as wide as the unfolding use the exact
+    :class:`EighProjector` basis. Subclasses change the random map by
+    overriding :meth:`sketch`.
 
     Parameters
     ----------
@@ -155,6 +180,8 @@ class GaussianSketchProjector(TensorGRaDProjector):
     seed : int, optional
         Seed of the projector's own random generator, so sketching does not
         consume the global random stream.
+    align : bool, optional
+        Whether to Procrustes-align each new factor to the previous one.
 
     References
     ----------
@@ -171,24 +198,22 @@ class GaussianSketchProjector(TensorGRaDProjector):
         oversample: int = 5,
         power_iterations: int = 0,
         seed: int = 0,
+        align: bool = False,
     ):
-        super().__init__(rank, update_proj_gap=update_proj_gap, scale=scale)
+        super().__init__(rank, update_proj_gap=update_proj_gap, scale=scale, align=align)
         self.oversample = oversample
         self.power_iterations = power_iterations
         self.seed = seed
         self.generator = None
 
-    def get_projection_tensor(self, weights, rank):
-        return [self.basis(unfold(weights.data, mode), r) for mode, r in enumerate(rank)]
-
     def basis(self, a, rank):
         width = rank + self.oversample
         if width >= a.shape[0]:
-            return torch.linalg.svd(a, full_matrices=False)[0][:, :rank]
+            return super().basis(a, rank)
         q = torch.linalg.qr(self.sketch(a, width))[0]
         for _ in range(self.power_iterations):
             q = torch.linalg.qr(a @ (a.mH @ q))[0]
-        return q @ torch.linalg.svd(q.mH @ a, full_matrices=False)[0][:, :rank]
+        return q @ super().basis(q.mH @ a, rank)
 
     def sketch(self, a, width):
         return a @ torch.randn(a.shape[1], width, dtype=a.dtype, device=a.device, generator=self.rng(a.device))
@@ -324,6 +349,9 @@ class TensorGRaD(Optimizer):
         Sketched projectors only: extra sketch columns beyond the rank.
     power_iterations : int, optional
         Sketched projectors only: number of power iterations.
+    align : bool, optional
+        Eigh and sketched projectors only: Procrustes-align each new basis to
+        the previous one.
     """
 
     def __init__(
@@ -481,7 +509,12 @@ class TensorGRaD(Optimizer):
     def _make_low_rank_projector(param, group):
         rank = validate_tucker_rank(param.shape, group.get("rank", 0.25))
         projector = group.get("projector", "tucker")
-        common = dict(rank=rank, update_proj_gap=group.get("update_proj_gap", 50), scale=group.get("scale", 1.0))
+        common = dict(
+            rank=rank,
+            update_proj_gap=group.get("update_proj_gap", 50),
+            scale=group.get("scale", 1.0),
+            align=group.get("align", False),
+        )
         if projector == "eigh":
             return EighProjector(**common)
         if projector != "tucker":

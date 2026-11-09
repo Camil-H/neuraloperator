@@ -11,6 +11,7 @@ from ..tensorgrad import (
     EighProjector,
     GaussianSketchProjector,
     TensorGRaD,
+    procrustes_align,
     TensorGRaDProjector,
     UnstructuredSparseProjector,
     fno_tensorgrad_param_groups,
@@ -343,3 +344,24 @@ def test_tensorgrad_projector_group(projector, cls):
     state = optimizer.state[param]
     assert type(state["low_rank_projector"]) is cls
     assert state["low_rank_exp_avg"].shape == (2, 2, 2, 2)
+
+
+def test_procrustes_align_undoes_rotation_within_subspace():
+    torch.manual_seed(0)
+    reference = torch.linalg.qr(torch.randn(10, 3, dtype=torch.cfloat))[0]
+    rotation = torch.linalg.qr(torch.randn(3, 3, dtype=torch.cfloat))[0]
+
+    aligned = procrustes_align(reference @ rotation, reference)
+
+    assert_close(aligned, reference, atol=1e-5, rtol=1e-5)
+
+
+def test_aligned_projector_reproduces_previous_basis_of_same_subspace():
+    grad = low_rank_complex_tensor((16, 12, 10, 8), (3, 3, 3, 3))
+    rank = (3, 3, 3, 3)
+    previous = GaussianSketchProjector(rank=rank, seed=2).get_projection_tensor(grad, rank)
+    projector = GaussianSketchProjector(rank=rank, seed=1, align=True)
+    projector.proj_tensor = previous
+
+    for u, old in zip(projector.get_projection_tensor(grad, rank), previous):
+        assert_close(u, old, atol=1e-4, rtol=1e-4)
