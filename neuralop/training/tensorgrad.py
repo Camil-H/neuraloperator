@@ -144,6 +144,13 @@ class EighProjector(TensorGRaDProjector):
         return eigenvectors[:, -rank:].flip(-1).to(a.dtype)
 
 
+def transport_moments(state, old, new):
+    maps = [n.mH @ o for n, o in zip(new, old)]
+    second = state["low_rank_exp_avg_sq"]
+    state["low_rank_exp_avg"] = tenalg.multi_mode_dot(state["low_rank_exp_avg"], maps)
+    state["low_rank_exp_avg_sq"] = tenalg.multi_mode_dot(second, [m.abs().square().to(second.dtype) for m in maps])
+
+
 def procrustes_align(u, reference):
     """Rotate the orthonormal columns of ``u`` to best match ``reference``.
 
@@ -352,6 +359,10 @@ class TensorGRaD(Optimizer):
     align : bool, optional
         Eigh and sketched projectors only: Procrustes-align each new basis to
         the previous one.
+    transport : bool, optional
+        Carry the low-rank Adam moments into each new basis: the first moment
+        is mapped through ``U_new^H U_old`` per mode, the second through its
+        squared magnitudes.
     """
 
     def __init__(
@@ -435,7 +446,10 @@ class TensorGRaD(Optimizer):
                 state["sparse_projector"] = self._make_sparse_projector(group)
 
         low_rank_projector = state["low_rank_projector"]
+        previous = low_rank_projector.proj_tensor
         low_rank_grad = low_rank_projector.project(grad, state["step"])
+        if group.get("transport", False) and previous is not None and low_rank_projector.proj_tensor is not previous:
+            transport_moments(state, previous, low_rank_projector.proj_tensor)
 
         if "sparse_projector" not in state:
             update, step_size = self._adamw_update(

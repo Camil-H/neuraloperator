@@ -12,6 +12,7 @@ from ..tensorgrad import (
     GaussianSketchProjector,
     TensorGRaD,
     procrustes_align,
+    transport_moments,
     TensorGRaDProjector,
     UnstructuredSparseProjector,
     fno_tensorgrad_param_groups,
@@ -365,3 +366,39 @@ def test_aligned_projector_reproduces_previous_basis_of_same_subspace():
 
     for u, old in zip(projector.get_projection_tensor(grad, rank), previous):
         assert_close(u, old, atol=1e-4, rtol=1e-4)
+
+
+def test_transport_moments_preserves_first_moment_within_same_subspace():
+    shape, rank = (8, 6, 5, 4), (3, 3, 2, 2)
+    old = [torch.linalg.qr(torch.randn(n, r, dtype=torch.cfloat))[0] for n, r in zip(shape, rank)]
+    new = [u @ torch.linalg.qr(torch.randn(r, r, dtype=torch.cfloat))[0] for u, r in zip(old, rank)]
+    first = torch.randn(rank, dtype=torch.cfloat)
+    state = dict(low_rank_exp_avg=first.clone(), low_rank_exp_avg_sq=first.abs().square().to(first.dtype))
+    transport_moments(state, old, new)
+
+    full = lambda factors, core: tensorgrad_module.tenalg.multi_mode_dot(core, factors)
+    assert_close(full(new, state["low_rank_exp_avg"]), full(old, first), atol=1e-5, rtol=1e-5)
+    assert state["low_rank_exp_avg_sq"].real.min() >= 0
+
+
+def test_transport_moments_is_identity_for_unchanged_basis():
+    old = [torch.linalg.qr(torch.randn(n, 2, dtype=torch.cfloat))[0] for n in (6, 5, 4)]
+    first = torch.randn(2, 2, 2, dtype=torch.cfloat)
+    second = first.abs().square().to(first.dtype)
+    state = dict(low_rank_exp_avg=first, low_rank_exp_avg_sq=second)
+    transport_moments(state, old, old)
+
+    assert_close(state["low_rank_exp_avg"], first, atol=1e-5, rtol=1e-5)
+    assert_close(state["low_rank_exp_avg_sq"], second, atol=1e-5, rtol=1e-5)
+
+
+def test_tensorgrad_transport_keeps_moment_shapes():
+    torch.manual_seed(0)
+    param = Parameter(torch.randn(8, 8, 4, 3, dtype=torch.cfloat))
+    optimizer = TensorGRaD([dict(params=[param], tensorgrad=True, rank=0.5, projector="eigh", update_proj_gap=2, transport=True)])
+    for _ in range(5):
+        param.grad = torch.randn_like(param)
+        optimizer.step()
+    state = optimizer.state[param]
+    assert state["low_rank_exp_avg"].shape == state["low_rank_exp_avg_sq"].shape
+    assert torch.isfinite(param).all()
