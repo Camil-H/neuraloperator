@@ -8,6 +8,8 @@ from tensorly.base import unfold
 
 from ..adamw import AdamW
 from ..tensorgrad import (
+    EighProjector,
+    GaussianSketchProjector,
     TensorGRaD,
     TensorGRaDProjector,
     UnstructuredSparseProjector,
@@ -283,3 +285,61 @@ def test_tensorgrad_projector_is_mode_unfolding_projection(mode):
     restored = projector.inverse_transform(factors, projector.transform(factors, grad))
 
     assert_close(unfold(restored, mode), u @ (u.mH @ unfold(grad, mode)))
+
+
+def low_rank_complex_tensor(shape, rank):
+    torch.manual_seed(0)
+    core = torch.randn(*rank, dtype=torch.cfloat)
+    factors = [torch.linalg.qr(torch.randn(n, r, dtype=torch.cfloat))[0] for n, r in zip(shape, rank)]
+    return TensorGRaDProjector(rank=rank).inverse_transform(factors, core)
+
+
+@pytest.mark.parametrize("power_iterations", [0, 1])
+def test_gaussian_sketch_projector_recovers_low_rank_tensor(power_iterations):
+    grad = low_rank_complex_tensor((16, 12, 10, 8), (2, 2, 2, 2))
+    projector = GaussianSketchProjector(rank=(2, 2, 2, 2), power_iterations=power_iterations)
+
+    restored = projector.project_back(projector.project(grad, 0))
+
+    assert_close(restored, grad, atol=1e-5, rtol=1e-4)
+    for u in projector.proj_tensor:
+        assert_close(u.mH @ u, torch.eye(2, dtype=u.dtype), atol=1e-5, rtol=1e-5)
+
+
+def test_gaussian_sketch_projector_is_exact_when_sketch_covers_mode():
+    torch.manual_seed(0)
+    grad = torch.randn(6, 5, 4, 3, dtype=torch.cfloat)
+    rank = (2, 2, 2, 2)
+    projector = GaussianSketchProjector(rank=rank, oversample=5)
+
+    factors = projector.get_projection_tensor(grad, rank)
+
+    for mode, u in enumerate(factors):
+        exact = torch.linalg.svd(unfold(grad, mode), full_matrices=False)[0][:, :2]
+        assert_close(u @ u.mH, exact @ exact.mH, atol=1e-5, rtol=1e-5)
+
+
+def test_eigh_projector_matches_exact_svd_subspace():
+    torch.manual_seed(0)
+    grad = torch.randn(8, 6, 5, 3, dtype=torch.cfloat)
+    rank = (3, 2, 2, 2)
+
+    factors = EighProjector(rank=rank).get_projection_tensor(grad, rank)
+
+    for mode, (u, r) in enumerate(zip(factors, rank)):
+        exact = torch.linalg.svd(unfold(grad, mode), full_matrices=False)[0][:, :r]
+        assert u.dtype == grad.dtype
+        assert_close(u @ u.mH, exact @ exact.mH, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("projector, cls", [("eigh", EighProjector), ("gaussian", GaussianSketchProjector)])
+def test_tensorgrad_projector_group(projector, cls):
+    param = Parameter(torch.randn(16, 12, 10, 8, dtype=torch.cfloat))
+    optimizer = TensorGRaD([{"params": [param], "tensorgrad": True, "rank": (2, 2, 2, 2), "projector": projector}])
+
+    (param.abs() ** 2).sum().backward()
+    optimizer.step()
+
+    state = optimizer.state[param]
+    assert type(state["low_rank_projector"]) is cls
+    assert state["low_rank_exp_avg"].shape == (2, 2, 2, 2)

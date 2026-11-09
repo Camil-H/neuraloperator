@@ -3,6 +3,7 @@ from typing import Callable, Iterable, Optional
 
 import torch
 from tensorly import tenalg
+from tensorly.base import unfold
 from tensorly.decomposition import tucker
 from torch import nn
 from torch.optim import Optimizer
@@ -96,6 +97,109 @@ class TensorGRaDProjector:
         if self.activation_checkpoint:
             return checkpoint(tenalg.multi_mode_dot, x, factors)
         return tenalg.multi_mode_dot(x, factors)
+
+
+class EighProjector(TensorGRaDProjector):
+    """Low-rank gradient projector with exact mode-wise factors from Gram matrices.
+
+    Drop-in replacement for :class:`TensorGRaDProjector`: the projection is the
+    same mode-wise product, but each factor ``U_k`` is computed directly as the
+    top-``r_k`` eigenvectors of ``A_k A_k^H``, where ``A_k`` is the mode-``k``
+    unfolding of the gradient. These are the top left singular vectors of
+    ``A_k`` (a truncated HOSVD), obtained without alternating least squares.
+    The Gram matrix is ``n_k x n_k``, so the cost is one ``n_k^2 m_k`` product
+    plus a small eigendecomposition. Both run in double precision, because
+    squaring the singular values squares the condition number.
+
+    Parameters
+    ----------
+    rank : tuple[int, ...]
+        Target rank per mode.
+    update_proj_gap : int, optional
+        Number of optimizer steps between projection-tensor updates.
+    scale : float, optional
+        Scalar applied after projecting low-rank updates back to full size.
+    """
+
+    def get_projection_tensor(self, weights, rank):
+        return [self.basis(unfold(weights.data, mode), r) for mode, r in enumerate(rank)]
+
+    def basis(self, a, rank):
+        a_double = a.to(torch.complex128 if a.is_complex() else torch.float64)
+        eigenvectors = torch.linalg.eigh(a_double @ a_double.mH)[1]
+        return eigenvectors[:, -rank:].flip(-1).to(a.dtype)
+
+
+class GaussianSketchProjector(TensorGRaDProjector):
+    """Low-rank gradient projector whose factors come from a randomized range finder.
+
+    Drop-in replacement for :class:`TensorGRaDProjector`: the projection is the
+    same mode-wise product, but each factor ``U_k`` is the top-``r_k`` left
+    singular subspace of the mode-``k`` unfolding estimated from a random
+    sketch ``Y = (A A^H)^q A Omega`` instead of a Tucker decomposition. Modes
+    where the sketch would be at least as wide as the unfolding use an exact
+    SVD. Subclasses change the random map by overriding :meth:`sketch`.
+
+    Parameters
+    ----------
+    rank : tuple[int, ...]
+        Target rank per mode.
+    update_proj_gap : int, optional
+        Number of optimizer steps between projection-tensor updates.
+    scale : float, optional
+        Scalar applied after projecting low-rank updates back to full size.
+    oversample : int, optional
+        Extra sketch columns beyond the target rank.
+    power_iterations : int, optional
+        Number of power iterations ``q``.
+    seed : int, optional
+        Seed of the projector's own random generator, so sketching does not
+        consume the global random stream.
+
+    References
+    ----------
+    .. _[1] : Halko, N., Martinsson, P.-G., Tropp, J. A. (2011). Finding
+        Structure with Randomness: Probabilistic Algorithms for Constructing
+        Approximate Matrix Decompositions. SIAM Review 53(2), 217-288.
+    """
+
+    def __init__(
+        self,
+        rank,
+        update_proj_gap: int = 200,
+        scale: float = 1.0,
+        oversample: int = 5,
+        power_iterations: int = 0,
+        seed: int = 0,
+    ):
+        super().__init__(rank, update_proj_gap=update_proj_gap, scale=scale)
+        self.oversample = oversample
+        self.power_iterations = power_iterations
+        self.seed = seed
+        self.generator = None
+
+    def get_projection_tensor(self, weights, rank):
+        return [self.basis(unfold(weights.data, mode), r) for mode, r in enumerate(rank)]
+
+    def basis(self, a, rank):
+        width = rank + self.oversample
+        if width >= a.shape[0]:
+            return torch.linalg.svd(a, full_matrices=False)[0][:, :rank]
+        q = torch.linalg.qr(self.sketch(a, width))[0]
+        for _ in range(self.power_iterations):
+            q = torch.linalg.qr(a @ (a.mH @ q))[0]
+        return q @ torch.linalg.svd(q.mH @ a, full_matrices=False)[0][:, :rank]
+
+    def sketch(self, a, width):
+        return a @ torch.randn(a.shape[1], width, dtype=a.dtype, device=a.device, generator=self.rng(a.device))
+
+    def rng(self, device):
+        if self.generator is None or self.generator.device != device:
+            self.generator = torch.Generator(device=device).manual_seed(self.seed)
+        return self.generator
+
+
+SKETCHED_PROJECTORS = {"gaussian": GaussianSketchProjector}
 
 
 class UnstructuredSparseProjector:
@@ -212,6 +316,14 @@ class TensorGRaD(Optimizer):
         Scalar applied to the projected-back sparse update.
     lambda_sparse : float, optional
         Weight used when adding the sparse update to the low-rank update.
+    projector : {"tucker", "eigh", "gaussian"}, optional
+        How the low-rank factors are computed. ``"tucker"`` (default) uses
+        :class:`TensorGRaDProjector`, ``"eigh"`` uses :class:`EighProjector`,
+        and the others use a sketched projector from ``SKETCHED_PROJECTORS``.
+    oversample : int, optional
+        Sketched projectors only: extra sketch columns beyond the rank.
+    power_iterations : int, optional
+        Sketched projectors only: number of power iterations.
     """
 
     def __init__(
@@ -368,6 +480,16 @@ class TensorGRaD(Optimizer):
     @staticmethod
     def _make_low_rank_projector(param, group):
         rank = validate_tucker_rank(param.shape, group.get("rank", 0.25))
+        projector = group.get("projector", "tucker")
+        common = dict(rank=rank, update_proj_gap=group.get("update_proj_gap", 50), scale=group.get("scale", 1.0))
+        if projector == "eigh":
+            return EighProjector(**common)
+        if projector != "tucker":
+            return SKETCHED_PROJECTORS[projector](
+                **common,
+                oversample=group.get("oversample", 5),
+                power_iterations=group.get("power_iterations", 0),
+            )
         return TensorGRaDProjector(
             rank=rank,
             update_proj_gap=group.get("update_proj_gap", 50),
@@ -399,6 +521,8 @@ def fno_tensorgrad_param_groups(
     sparse_type: str = "randk",
     lambda_sparse: float = 1.0,
     warm_restart: bool = True,
+    projector: str = "tucker",
+    **projector_options,
 ):
     """Return AdamW and TensorGRaD parameter groups for FNO spectral weights.
 
@@ -430,6 +554,11 @@ def fno_tensorgrad_param_groups(
     warm_restart : bool, optional
         Whether Tucker decomposition reuses the previous projection factors
         when updating the low-rank basis.
+    projector : {"tucker", "eigh", "gaussian"}, optional
+        How the low-rank factors are computed; see :class:`TensorGRaD`.
+    **projector_options
+        Passed into the TensorGRaD group, e.g. ``oversample`` and
+        ``power_iterations`` for sketched projectors.
     """
 
     module = model.module if hasattr(model, "module") else model
@@ -459,6 +588,8 @@ def fno_tensorgrad_param_groups(
         "update_proj_gap": update_proj_gap,
         "scale": scale,
         "warm_restart": warm_restart,
+        "projector": projector,
+        **projector_options,
     }
     if sparse_ratio is not None:
         tensorgrad_group.update(
