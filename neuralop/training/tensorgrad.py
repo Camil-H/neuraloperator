@@ -119,7 +119,7 @@ class EighProjector(TensorGRaDProjector):
     The eigendecomposition yields the whole spectrum, so with ``tol`` the rank
     of each mode is chosen at every refresh as the smallest ``r`` whose
     discarded singular values hold at most a ``tol`` fraction of the
-    unfolding's Frobenius norm, and ``rank`` is ignored.
+    unfolding's Frobenius norm, capped at ``rank``.
 
     Parameters
     ----------
@@ -150,7 +150,7 @@ class EighProjector(TensorGRaDProjector):
         a_double = a.to(torch.complex128 if a.is_complex() else torch.float64)
         eigenvalues, eigenvectors = torch.linalg.eigh(a_double @ a_double.mH)
         if self.tol is not None:
-            rank = rank_for_tolerance(eigenvalues.flip(0).clamp(min=0), self.tol)
+            rank = min(rank, rank_for_tolerance(eigenvalues.flip(0).clamp(min=0), self.tol))
         return eigenvectors[:, -rank:].flip(-1).to(a.dtype)
 
 
@@ -391,7 +391,7 @@ class TensorGRaD(Optimizer):
         squared magnitudes. ``"first"`` maps only the first moment.
     tol : float, optional
         Eigh projector only: choose each mode's rank at every refresh from
-        this relative Frobenius tolerance instead of ``rank``. Core moments
+        this relative Frobenius tolerance, with ``rank`` as the cap. Core moments
         are kept index by index when the rank changes, with new entries zero.
     """
 

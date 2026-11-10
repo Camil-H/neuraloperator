@@ -408,9 +408,11 @@ def test_tensorgrad_transport_keeps_moment_shapes():
 
 def test_eigh_projector_tolerance_picks_rank_from_spectrum():
     grad = low_rank_complex_tensor((16, 12, 10, 8), (3, 4, 2, 5))
-    projector = EighProjector(rank=(1, 1, 1, 1), tol=1e-3)
+    projector = EighProjector(rank=(16, 12, 10, 8), tol=1e-3)
+    capped = EighProjector(rank=(2, 2, 2, 2), tol=1e-3)
 
     assert [u.shape[1] for u in projector.get_projection_tensor(grad, projector.rank)] == [3, 4, 2, 5]
+    assert [u.shape[1] for u in capped.get_projection_tensor(grad, capped.rank)] == [2, 2, 2, 2]
 
 
 def test_rank_for_tolerance_matches_frobenius_tail():
@@ -437,7 +439,7 @@ def test_resize_moments_keeps_leading_entries():
 def test_tensorgrad_adaptive_rank_keeps_moments_consistent(transport):
     torch.manual_seed(0)
     param = Parameter(torch.randn(8, 8, 4, 3, dtype=torch.cfloat))
-    group = dict(params=[param], tensorgrad=True, projector="eigh", tol=0.3, update_proj_gap=2, transport=transport)
+    group = dict(params=[param], tensorgrad=True, rank=1.0, projector="eigh", tol=0.3, update_proj_gap=2, transport=transport)
     optimizer = TensorGRaD([group])
     for step in range(6):
         param.grad = low_rank_complex_tensor(param.shape, (1 + step % 3,) * 4)
