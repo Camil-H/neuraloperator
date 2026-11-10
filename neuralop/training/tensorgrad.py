@@ -116,6 +116,11 @@ class EighProjector(TensorGRaDProjector):
     ``align=True`` each new factor is rotated onto the previous one by an
     orthogonal Procrustes step, which leaves the subspace unchanged.
 
+    The eigendecomposition yields the whole spectrum, so with ``tol`` the rank
+    of each mode is chosen at every refresh as the smallest ``r`` whose
+    discarded singular values hold at most a ``tol`` fraction of the
+    unfolding's Frobenius norm, and ``rank`` is ignored.
+
     Parameters
     ----------
     rank : tuple[int, ...]
@@ -126,11 +131,14 @@ class EighProjector(TensorGRaDProjector):
         Scalar applied after projecting low-rank updates back to full size.
     align : bool, optional
         Whether to Procrustes-align each new factor to the previous one.
+    tol : float, optional
+        Relative Frobenius tolerance that sets the rank of each mode.
     """
 
-    def __init__(self, rank, update_proj_gap: int = 200, scale: float = 1.0, align: bool = False):
+    def __init__(self, rank, update_proj_gap: int = 200, scale: float = 1.0, align: bool = False, tol: Optional[float] = None):
         super().__init__(rank, update_proj_gap=update_proj_gap, scale=scale)
         self.align = align
+        self.tol = tol
 
     def get_projection_tensor(self, weights, rank):
         factors = [self.basis(unfold(weights.data, mode), r) for mode, r in enumerate(rank)]
@@ -140,15 +148,33 @@ class EighProjector(TensorGRaDProjector):
 
     def basis(self, a, rank):
         a_double = a.to(torch.complex128 if a.is_complex() else torch.float64)
-        eigenvectors = torch.linalg.eigh(a_double @ a_double.mH)[1]
+        eigenvalues, eigenvectors = torch.linalg.eigh(a_double @ a_double.mH)
+        if self.tol is not None:
+            rank = rank_for_tolerance(eigenvalues.flip(0).clamp(min=0), self.tol)
         return eigenvectors[:, -rank:].flip(-1).to(a.dtype)
 
 
-def transport_moments(state, old, new):
+def rank_for_tolerance(eigenvalues, tol):
+    discarded = eigenvalues.sum() - eigenvalues.cumsum(0)
+    return int((discarded > tol**2 * eigenvalues.sum()).sum()) + 1 if eigenvalues.sum() > 0 else 1
+
+
+def transport_moments(state, old, new, second=True):
     maps = [n.mH @ o for n, o in zip(new, old)]
-    second = state["low_rank_exp_avg_sq"]
     state["low_rank_exp_avg"] = tenalg.multi_mode_dot(state["low_rank_exp_avg"], maps)
-    state["low_rank_exp_avg_sq"] = tenalg.multi_mode_dot(second, [m.abs().square().to(second.dtype) for m in maps])
+    if second:
+        variance = state["low_rank_exp_avg_sq"]
+        state["low_rank_exp_avg_sq"] = tenalg.multi_mode_dot(variance, [m.abs().square().to(variance.dtype) for m in maps])
+
+
+def resize_moments(state, shape):
+    for key in ("low_rank_exp_avg", "low_rank_exp_avg_sq"):
+        old = state[key]
+        if old.shape == shape:
+            continue
+        overlap = tuple(slice(min(a, b)) for a, b in zip(old.shape, shape))
+        state[key] = old.new_zeros(shape)
+        state[key][overlap] = old[overlap]
 
 
 def procrustes_align(u, reference):
@@ -359,10 +385,14 @@ class TensorGRaD(Optimizer):
     align : bool, optional
         Eigh and sketched projectors only: Procrustes-align each new basis to
         the previous one.
-    transport : bool, optional
+    transport : bool or "first", optional
         Carry the low-rank Adam moments into each new basis: the first moment
         is mapped through ``U_new^H U_old`` per mode, the second through its
-        squared magnitudes.
+        squared magnitudes. ``"first"`` maps only the first moment.
+    tol : float, optional
+        Eigh projector only: choose each mode's rank at every refresh from
+        this relative Frobenius tolerance instead of ``rank``. Core moments
+        are kept index by index when the rank changes, with new entries zero.
     """
 
     def __init__(
@@ -448,8 +478,11 @@ class TensorGRaD(Optimizer):
         low_rank_projector = state["low_rank_projector"]
         previous = low_rank_projector.proj_tensor
         low_rank_grad = low_rank_projector.project(grad, state["step"])
-        if group.get("transport", False) and previous is not None and low_rank_projector.proj_tensor is not previous:
-            transport_moments(state, previous, low_rank_projector.proj_tensor)
+        transport = group.get("transport", False)
+        if transport and previous is not None and low_rank_projector.proj_tensor is not previous:
+            transport_moments(state, previous, low_rank_projector.proj_tensor, second=transport != "first")
+        if "low_rank_exp_avg" in state:
+            resize_moments(state, low_rank_grad.shape)
 
         if "sparse_projector" not in state:
             update, step_size = self._adamw_update(
@@ -530,7 +563,7 @@ class TensorGRaD(Optimizer):
             align=group.get("align", False),
         )
         if projector == "eigh":
-            return EighProjector(**common)
+            return EighProjector(**common, tol=group.get("tol"))
         if projector != "tucker":
             return SKETCHED_PROJECTORS[projector](
                 **common,
