@@ -529,6 +529,7 @@ Optimizers
 
     TensorGRaD
     TensorGRaDProjector
+    EighProjector
     UnstructuredSparseProjector
 
 .. autosummary::

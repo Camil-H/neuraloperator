@@ -4,10 +4,15 @@ from torch.testing import assert_close
 import pytest
 import math
 import neuralop.training.tensorgrad as tensorgrad_module
+from tensorly.base import unfold
 
 from ..adamw import AdamW
 from ..tensorgrad import (
+    EighProjector,
     TensorGRaD,
+    rank_for_tolerance,
+    resize_moments,
+    transport_first_moment,
     TensorGRaDProjector,
     UnstructuredSparseProjector,
     fno_tensorgrad_param_groups,
@@ -269,3 +274,118 @@ def test_fno_tensorgrad_param_groups_select_spectral_params():
     assert groups[1]["sparse_ratio"] == 0.05
     assert tensorgrad_params
     assert regular_ids.isdisjoint(tensorgrad_ids)
+
+
+def low_rank_complex_tensor(shape, rank):
+    torch.manual_seed(0)
+    core = torch.randn(*rank, dtype=torch.cfloat)
+    factors = [
+        torch.linalg.qr(torch.randn(n, r, dtype=torch.cfloat))[0]
+        for n, r in zip(shape, rank)
+    ]
+    return TensorGRaDProjector(rank=rank).inverse_transform(factors, core)
+
+
+def test_eigh_projector_matches_exact_svd_subspace():
+    torch.manual_seed(0)
+    grad = torch.randn(8, 6, 5, 3, dtype=torch.cfloat)
+    rank = (3, 2, 2, 2)
+
+    factors = EighProjector(rank=rank).get_projection_tensor(grad, rank)
+
+    for mode, (u, r) in enumerate(zip(factors, rank)):
+        exact = torch.linalg.svd(unfold(grad, mode), full_matrices=False)[0][:, :r]
+        assert u.dtype == grad.dtype
+        assert_close(u @ u.mH, exact @ exact.mH, atol=1e-5, rtol=1e-5)
+
+
+def test_eigh_projector_tolerance_picks_rank_from_spectrum():
+    grad = low_rank_complex_tensor((16, 12, 10, 8), (3, 4, 2, 5))
+    projector = EighProjector(rank=(16, 12, 10, 8), tol=1e-3)
+    capped = EighProjector(rank=(2, 2, 2, 2), tol=1e-3)
+
+    ranks = [u.shape[1] for u in projector.get_projection_tensor(grad, projector.rank)]
+    capped_ranks = [u.shape[1] for u in capped.get_projection_tensor(grad, capped.rank)]
+
+    assert ranks == [3, 4, 2, 5]
+    assert capped_ranks == [2, 2, 2, 2]
+
+
+def test_rank_for_tolerance_matches_frobenius_tail():
+    eigenvalues = torch.tensor([16.0, 4.0, 1.0, 0.0])
+
+    assert rank_for_tolerance(eigenvalues, 0.5) == 1
+    assert rank_for_tolerance(eigenvalues, 0.25) == 2
+    assert rank_for_tolerance(eigenvalues, 0.2) == 3
+    assert rank_for_tolerance(eigenvalues, 0.0) == 3
+    assert rank_for_tolerance(torch.zeros(3), 0.1) == 1
+
+
+def test_resize_moments_keeps_leading_entries():
+    first = torch.arange(6.0).reshape(2, 3)
+    state = {"low_rank_exp_avg": first.clone(), "low_rank_exp_avg_sq": first.clone()}
+
+    resize_moments(state, (3, 2))
+
+    expected = torch.tensor([[0.0, 1.0], [3.0, 4.0], [0.0, 0.0]])
+    assert_close(state["low_rank_exp_avg"], expected)
+    assert_close(state["low_rank_exp_avg_sq"], expected)
+
+
+def test_transport_first_moment_preserves_it_within_same_subspace():
+    torch.manual_seed(0)
+    shape, rank = (8, 6, 5, 4), (3, 3, 2, 2)
+    old = [
+        torch.linalg.qr(torch.randn(n, r, dtype=torch.cfloat))[0]
+        for n, r in zip(shape, rank)
+    ]
+    new = [
+        u @ torch.linalg.qr(torch.randn(r, r, dtype=torch.cfloat))[0]
+        for u, r in zip(old, rank)
+    ]
+    first = torch.randn(rank, dtype=torch.cfloat)
+    state = {"low_rank_exp_avg": first.clone()}
+
+    transport_first_moment(state, old, new)
+
+    full = tensorgrad_module.tenalg.multi_mode_dot
+    restored = full(state["low_rank_exp_avg"], new)
+    assert_close(restored, full(first, old), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("tol", [None, 0.3])
+@pytest.mark.parametrize("transport", [False, True])
+def test_tensorgrad_eigh_group_keeps_moments_consistent(tol, transport):
+    torch.manual_seed(0)
+    param = Parameter(torch.randn(8, 8, 4, 3, dtype=torch.cfloat))
+    group = {
+        "params": [param],
+        "tensorgrad": True,
+        "rank": 1.0,
+        "projector": "eigh",
+        "tol": tol,
+        "transport": transport,
+        "update_proj_gap": 2,
+    }
+    optimizer = TensorGRaD([group])
+
+    for step in range(6):
+        param.grad = low_rank_complex_tensor(param.shape, (1 + step % 3,) * 4)
+        optimizer.step()
+        state = optimizer.state[param]
+        assert type(state["low_rank_projector"]) is EighProjector
+        assert state["low_rank_exp_avg"].shape == state["low_rank_exp_avg_sq"].shape
+
+    assert torch.isfinite(param).all()
+
+
+def test_fno_tensorgrad_param_groups_pass_eigh_options():
+    model = FNO(n_modes=(4, 4), hidden_channels=8, in_channels=1, out_channels=1)
+
+    groups = fno_tensorgrad_param_groups(
+        model, min_params=0, projector="eigh", tol=0.01, transport=True
+    )
+
+    assert groups[1]["projector"] == "eigh"
+    assert groups[1]["tol"] == 0.01
+    assert groups[1]["transport"]

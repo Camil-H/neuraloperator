@@ -3,6 +3,7 @@ from typing import Callable, Iterable, Optional
 
 import torch
 from tensorly import tenalg
+from tensorly.base import unfold
 from tensorly.decomposition import tucker
 from torch import nn
 from torch.optim import Optimizer
@@ -96,6 +97,90 @@ class TensorGRaDProjector:
         if self.activation_checkpoint:
             return checkpoint(tenalg.multi_mode_dot, x, factors)
         return tenalg.multi_mode_dot(x, factors)
+
+
+class EighProjector(TensorGRaDProjector):
+    """Low-rank gradient projector with exact mode-wise factors from Gram matrices.
+
+    Drop-in replacement for :class:`TensorGRaDProjector`: the projection is the
+    same mode-wise product, but each factor ``U_k`` is computed directly as the
+    top-``r_k`` eigenvectors of ``A_k A_k^H``, where ``A_k`` is the mode-``k``
+    unfolding of the gradient. These are the top left singular vectors of
+    ``A_k`` (a truncated HOSVD), obtained without alternating least squares.
+    The Gram matrix is ``n_k x n_k``, so the cost is one ``n_k^2 m_k`` product
+    plus a small eigendecomposition. Both run in double precision, because
+    squaring the singular values squares the condition number.
+
+    The eigendecomposition yields the whole spectrum, so with ``tol`` the rank
+    of each mode is chosen at every refresh as the smallest ``r`` whose
+    discarded singular values hold at most a ``tol`` fraction of the
+    unfolding's Frobenius norm, capped at ``rank``.
+
+    Parameters
+    ----------
+    rank : tuple[int, ...]
+        Rank per mode, or the cap on it when ``tol`` is set.
+    update_proj_gap : int, optional
+        Number of optimizer steps between projection-tensor updates.
+    scale : float, optional
+        Scalar applied after projecting low-rank updates back to full size.
+    tol : float, optional
+        Relative Frobenius tolerance that sets the rank of each mode.
+    """
+
+    def __init__(
+        self,
+        rank,
+        update_proj_gap: int = 200,
+        scale: float = 1.0,
+        tol: Optional[float] = None,
+    ):
+        super().__init__(rank, update_proj_gap=update_proj_gap, scale=scale)
+        self.tol = tol
+
+    def get_projection_tensor(self, weights, rank):
+        return [
+            self.basis(unfold(weights.data, mode), r) for mode, r in enumerate(rank)
+        ]
+
+    def basis(self, a, rank):
+        a_double = a.to(torch.complex128 if a.is_complex() else torch.float64)
+        eigenvalues, eigenvectors = torch.linalg.eigh(a_double @ a_double.mH)
+        if self.tol is not None:
+            spectrum = eigenvalues.flip(0).clamp(min=0)
+            rank = min(rank, rank_for_tolerance(spectrum, self.tol))
+        return eigenvectors[:, -rank:].flip(-1).to(a.dtype)
+
+
+def rank_for_tolerance(eigenvalues, tol):
+    """Smallest rank whose discarded eigenvalues hold at most ``tol**2`` of the total.
+
+    ``eigenvalues`` are the squared singular values in decreasing order, so
+    this is the smallest ``r`` with relative Frobenius truncation error at
+    most ``tol``.
+    """
+    total = eigenvalues.sum()
+    if total <= 0:
+        return 1
+    discarded = total - eigenvalues.cumsum(0)
+    return int((discarded > tol**2 * total).sum()) + 1
+
+
+def transport_first_moment(state, old, new):
+    """Map the low-rank first moment from factors ``old`` into factors ``new``."""
+    maps = [n.mH @ o for n, o in zip(new, old)]
+    state["low_rank_exp_avg"] = tenalg.multi_mode_dot(state["low_rank_exp_avg"], maps)
+
+
+def resize_moments(state, shape):
+    """Pad with zeros or truncate the low-rank moments to ``shape``, by index."""
+    for key in ("low_rank_exp_avg", "low_rank_exp_avg_sq"):
+        old = state[key]
+        if old.shape == shape:
+            continue
+        overlap = tuple(slice(min(a, b)) for a, b in zip(old.shape, shape))
+        state[key] = old.new_zeros(shape)
+        state[key][overlap] = old[overlap]
 
 
 class UnstructuredSparseProjector:
@@ -212,6 +297,17 @@ class TensorGRaD(Optimizer):
         Scalar applied to the projected-back sparse update.
     lambda_sparse : float, optional
         Weight used when adding the sparse update to the low-rank update.
+    projector : {"tucker", "eigh"}, optional
+        How the low-rank factors are computed: ``"tucker"`` (default) uses
+        :class:`TensorGRaDProjector`, ``"eigh"`` uses :class:`EighProjector`.
+    tol : float, optional
+        Eigh projector only: choose each mode's rank at every refresh from
+        this relative Frobenius tolerance, with ``rank`` as the cap. Low-rank
+        moments are kept index by index when the rank changes, with new
+        entries set to zero.
+    transport : bool, optional
+        Map the low-rank first moment into each new basis through
+        ``U_new^H U_old`` per mode. The second moment is kept as is.
     """
 
     def __init__(
@@ -295,7 +391,14 @@ class TensorGRaD(Optimizer):
                 state["sparse_projector"] = self._make_sparse_projector(group)
 
         low_rank_projector = state["low_rank_projector"]
+        previous = low_rank_projector.proj_tensor
         low_rank_grad = low_rank_projector.project(grad, state["step"])
+        current = low_rank_projector.proj_tensor
+        refreshed = previous is not None and current is not previous
+        if refreshed and group.get("transport", False):
+            transport_first_moment(state, previous, current)
+        if "low_rank_exp_avg" in state:
+            resize_moments(state, low_rank_grad.shape)
 
         if "sparse_projector" not in state:
             update, step_size = self._adamw_update(
@@ -368,6 +471,13 @@ class TensorGRaD(Optimizer):
     @staticmethod
     def _make_low_rank_projector(param, group):
         rank = validate_tucker_rank(param.shape, group.get("rank", 0.25))
+        if group.get("projector", "tucker") == "eigh":
+            return EighProjector(
+                rank=rank,
+                update_proj_gap=group.get("update_proj_gap", 50),
+                scale=group.get("scale", 1.0),
+                tol=group.get("tol"),
+            )
         return TensorGRaDProjector(
             rank=rank,
             update_proj_gap=group.get("update_proj_gap", 50),
@@ -399,6 +509,9 @@ def fno_tensorgrad_param_groups(
     sparse_type: str = "randk",
     lambda_sparse: float = 1.0,
     warm_restart: bool = True,
+    projector: str = "tucker",
+    tol: Optional[float] = None,
+    transport: bool = False,
 ):
     """Return AdamW and TensorGRaD parameter groups for FNO spectral weights.
 
@@ -430,6 +543,14 @@ def fno_tensorgrad_param_groups(
     warm_restart : bool, optional
         Whether Tucker decomposition reuses the previous projection factors
         when updating the low-rank basis.
+    projector : {"tucker", "eigh"}, optional
+        How the low-rank factors are computed; see :class:`TensorGRaD`.
+    tol : float, optional
+        Eigh projector only: relative Frobenius tolerance that sets each
+        mode's rank, capped at ``rank``; see :class:`TensorGRaD`.
+    transport : bool, optional
+        Map the low-rank first moment into each new basis; see
+        :class:`TensorGRaD`.
     """
 
     module = model.module if hasattr(model, "module") else model
@@ -459,6 +580,9 @@ def fno_tensorgrad_param_groups(
         "update_proj_gap": update_proj_gap,
         "scale": scale,
         "warm_restart": warm_restart,
+        "projector": projector,
+        "tol": tol,
+        "transport": transport,
     }
     if sparse_ratio is not None:
         tensorgrad_group.update(
