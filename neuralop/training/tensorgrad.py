@@ -140,19 +140,19 @@ class EighProjector(TensorGRaDProjector):
 
     def get_projection_tensor(self, weights, rank):
         return [
-            self.basis(unfold(weights.data, mode), r) for mode, r in enumerate(rank)
+            self._basis(unfold(weights.data, mode), r) for mode, r in enumerate(rank)
         ]
 
-    def basis(self, a, rank):
+    def _basis(self, a, rank):
         a_double = a.to(torch.complex128 if a.is_complex() else torch.float64)
         eigenvalues, eigenvectors = torch.linalg.eigh(a_double @ a_double.mH)
         if self.tol is not None:
             spectrum = eigenvalues.flip(0).clamp(min=0)
-            rank = min(rank, rank_for_tolerance(spectrum, self.tol))
+            rank = min(rank, _rank_for_tolerance(spectrum, self.tol))
         return eigenvectors[:, -rank:].flip(-1).to(a.dtype)
 
 
-def rank_for_tolerance(eigenvalues, tol):
+def _rank_for_tolerance(eigenvalues, tol):
     """Smallest rank whose discarded eigenvalues hold at most ``tol**2`` of the total.
 
     ``eigenvalues`` are the squared singular values in decreasing order, so
@@ -166,13 +166,13 @@ def rank_for_tolerance(eigenvalues, tol):
     return int((discarded > tol**2 * total).sum()) + 1
 
 
-def transport_first_moment(state, old, new):
+def _transport_first_moment(state, old, new):
     """Map the low-rank first moment from factors ``old`` into factors ``new``."""
     maps = [n.mH @ o for n, o in zip(new, old)]
     state["low_rank_exp_avg"] = tenalg.multi_mode_dot(state["low_rank_exp_avg"], maps)
 
 
-def resize_moments(state, shape):
+def _resize_moments(state, shape):
     """Pad with zeros or truncate the low-rank moments to ``shape``, by index."""
     for key in ("low_rank_exp_avg", "low_rank_exp_avg_sq"):
         old = state[key]
@@ -396,9 +396,9 @@ class TensorGRaD(Optimizer):
         current = low_rank_projector.proj_tensor
         refreshed = previous is not None and current is not previous
         if refreshed and group.get("transport", False):
-            transport_first_moment(state, previous, current)
+            _transport_first_moment(state, previous, current)
         if "low_rank_exp_avg" in state:
-            resize_moments(state, low_rank_grad.shape)
+            _resize_moments(state, low_rank_grad.shape)
 
         if "sparse_projector" not in state:
             update, step_size = self._adamw_update(
@@ -471,7 +471,14 @@ class TensorGRaD(Optimizer):
     @staticmethod
     def _make_low_rank_projector(param, group):
         rank = validate_tucker_rank(param.shape, group.get("rank", 0.25))
-        if group.get("projector", "tucker") == "eigh":
+        projector = group.get("projector", "tucker")
+        if projector not in ("tucker", "eigh"):
+            raise ValueError(
+                f"Unknown projector {projector!r}, expected 'tucker' or 'eigh'."
+            )
+        if group.get("tol") is not None and projector != "eigh":
+            raise ValueError("tol is only supported with projector='eigh'.")
+        if projector == "eigh":
             return EighProjector(
                 rank=rank,
                 update_proj_gap=group.get("update_proj_gap", 50),

@@ -4,17 +4,18 @@ from torch.testing import assert_close
 import pytest
 import math
 import neuralop.training.tensorgrad as tensorgrad_module
+from tensorly import tenalg
 from tensorly.base import unfold
 
 from ..adamw import AdamW
 from ..tensorgrad import (
     EighProjector,
     TensorGRaD,
-    rank_for_tolerance,
-    resize_moments,
-    transport_first_moment,
     TensorGRaDProjector,
     UnstructuredSparseProjector,
+    _rank_for_tolerance,
+    _resize_moments,
+    _transport_first_moment,
     fno_tensorgrad_param_groups,
 )
 
@@ -283,7 +284,7 @@ def low_rank_complex_tensor(shape, rank):
         torch.linalg.qr(torch.randn(n, r, dtype=torch.cfloat))[0]
         for n, r in zip(shape, rank)
     ]
-    return TensorGRaDProjector(rank=rank).inverse_transform(factors, core)
+    return tenalg.multi_mode_dot(core, factors)
 
 
 def test_eigh_projector_matches_exact_svd_subspace():
@@ -314,18 +315,18 @@ def test_eigh_projector_tolerance_picks_rank_from_spectrum():
 def test_rank_for_tolerance_matches_frobenius_tail():
     eigenvalues = torch.tensor([16.0, 4.0, 1.0, 0.0])
 
-    assert rank_for_tolerance(eigenvalues, 0.5) == 1
-    assert rank_for_tolerance(eigenvalues, 0.25) == 2
-    assert rank_for_tolerance(eigenvalues, 0.2) == 3
-    assert rank_for_tolerance(eigenvalues, 0.0) == 3
-    assert rank_for_tolerance(torch.zeros(3), 0.1) == 1
+    assert _rank_for_tolerance(eigenvalues, 0.5) == 1
+    assert _rank_for_tolerance(eigenvalues, 0.25) == 2
+    assert _rank_for_tolerance(eigenvalues, 0.2) == 3
+    assert _rank_for_tolerance(eigenvalues, 0.0) == 3
+    assert _rank_for_tolerance(torch.zeros(3), 0.1) == 1
 
 
 def test_resize_moments_keeps_leading_entries():
     first = torch.arange(6.0).reshape(2, 3)
     state = {"low_rank_exp_avg": first.clone(), "low_rank_exp_avg_sq": first.clone()}
 
-    resize_moments(state, (3, 2))
+    _resize_moments(state, (3, 2))
 
     expected = torch.tensor([[0.0, 1.0], [3.0, 4.0], [0.0, 0.0]])
     assert_close(state["low_rank_exp_avg"], expected)
@@ -346,11 +347,10 @@ def test_transport_first_moment_preserves_it_within_same_subspace():
     first = torch.randn(rank, dtype=torch.cfloat)
     state = {"low_rank_exp_avg": first.clone()}
 
-    transport_first_moment(state, old, new)
+    _transport_first_moment(state, old, new)
 
-    full = tensorgrad_module.tenalg.multi_mode_dot
-    restored = full(state["low_rank_exp_avg"], new)
-    assert_close(restored, full(first, old), atol=1e-5, rtol=1e-5)
+    restored = tenalg.multi_mode_dot(state["low_rank_exp_avg"], new)
+    assert_close(restored, tenalg.multi_mode_dot(first, old), atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("tol", [None, 0.3])
@@ -389,3 +389,16 @@ def test_fno_tensorgrad_param_groups_pass_eigh_options():
     assert groups[1]["projector"] == "eigh"
     assert groups[1]["tol"] == 0.01
     assert groups[1]["transport"]
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [({"projector": "svd"}, "Unknown projector"), ({"tol": 0.1}, "only supported")],
+)
+def test_tensorgrad_rejects_invalid_projector_options(options, message):
+    param = Parameter(torch.randn(4, 4, 3, 2, dtype=torch.cfloat))
+    optimizer = TensorGRaD([{"params": [param], "tensorgrad": True, **options}])
+    param.grad = torch.randn_like(param)
+
+    with pytest.raises(ValueError, match=message):
+        optimizer.step()
